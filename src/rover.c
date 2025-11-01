@@ -29,68 +29,108 @@ bool is_feasible_path(MapData* map, int start_x, int start_y, int end_x, int end
 int calculate_energy(MapData* map, int start_x, int start_y, int end_x, int end_y);
 void simulate_path(MapData* map, int* final_x, int* final_y, int* energy, bool* feasible);
 
-// Check parity bit for error detection
+// parity is in the LSB (bit 0)
+// bits 1–7 are the data bits
 bool check_parity(unsigned char byte) {
-    int count = 0;
-    for (int i = 0; i < 7; i++) {
-        if (byte & (1 << i)) count++;
+    int ones = 0;
+    // count data bits (bits 1..7)
+    for (int i = 1; i < 8; i++) {
+        if (byte & (1u << i)) {
+            ones++;
+        }
     }
-    return (count % 2) == (byte & 0x80 ? 1 : 0);
+    int expected = ones % 2;     // 1 if odd number of data bits, else 0
+    int actual   = byte & 0x01;  // LSB
+    return expected == actual;
 }
 
-// Decode binary map data
+// Decode binary map data according to the spec
 void decode_map_data(const char* filename, MapData* map) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
         printf("Input error: unable to process data/commands.\n");
         exit(1);
     }
-    
-    // Read rover position
-    fread(&map->rover_x, 1, 1, file);
-    fread(&map->rover_y, 1, 1, file);
-    
-    // Initialize arrays
-    memset(map->is_rover, false, sizeof(map->is_rover));
-    memset(map->is_goal, false, sizeof(map->is_goal));
-    memset(map->is_corrupted, false, sizeof(map->is_corrupted));
+
+    // read backup rover position (always 2 bytes)
+    if (fread(&map->rover_x, 1, 1, file) != 1 ||
+        fread(&map->rover_y, 1, 1, file) != 1) {
+        printf("Input error: unable to process data/commands.\n");
+        fclose(file);
+        exit(1);
+    }
+
+    // clear arrays
+    memset(map->topography,   0, sizeof(map->topography));
+    memset(map->terrain_type, 0, sizeof(map->terrain_type));
+    memset(map->is_rover,     0, sizeof(map->is_rover));
+    memset(map->is_goal,      0, sizeof(map->is_goal));
+    memset(map->is_corrupted, 0, sizeof(map->is_corrupted));
+
     map->ngoals = 0;
-    
-    // Read map data row by row
+
+    bool found_rover_cell = false;
+
+    // now read 128x128 bytes, row by row, x fastest
     for (int y = 0; y < MAP_SIZE; y++) {
         for (int x = 0; x < MAP_SIZE; x++) {
+
             unsigned char byte;
-            fread(&byte, 1, 1, file);
-            
-            // Check for corruption
+            if (fread(&byte, 1, 1, file) != 1) {
+                // file shorter than expected → input error
+                printf("Input error: unable to process data/commands.\n");
+                fclose(file);
+                exit(1);
+            }
+
+            // check parity FIRST
             if (!check_parity(byte)) {
+                // mark corrupted; we'll fix later with 3x3
                 map->is_corrupted[y][x] = true;
                 continue;
             }
-            
-            // Extract data from byte
-            unsigned char height = byte & 0x07;           // bits 0-2
-            unsigned char terrain = (byte >> 3) & 0x03;   // bits 3-4
-            bool is_goal_cell = (byte >> 5) & 0x01;       // bit 5
-            bool is_rover_cell = (byte >> 6) & 0x01;      // bit 6
-            
-            map->topography[y][x] = height;
+
+            /*
+                Byte layout from the assignment (MSB → LSB):
+
+                bits 7..5 : topographic height (3 bits)
+                bits 4..3 : terrain type (2 bits)
+                bit  2    : science goal flag
+                bit  1    : rover flag
+                bit  0    : parity bit
+            */
+
+            unsigned char height        = (byte >> 5) & 0x07;  // 3 bits
+            unsigned char terrain       = (byte >> 3) & 0x03;  // 2 bits
+            unsigned char is_goal_cell  = (byte >> 2) & 0x01;  // 1 bit
+            unsigned char is_rover_cell = (byte >> 1) & 0x01;  // 1 bit
+
+            map->topography[y][x]   = height;
             map->terrain_type[y][x] = terrain;
-            map->is_goal[y][x] = is_goal_cell;
-            map->is_rover[y][x] = is_rover_cell;
-            
-            // Collect science goals
+            map->is_goal[y][x]      = (is_goal_cell != 0);
+            map->is_rover[y][x]     = (is_rover_cell != 0);
+            map->is_corrupted[y][x] = false;   // this one is good
+
+            // science goals: only add when parity was OK → we are inside that branch now
             if (is_goal_cell && map->ngoals < MAX_GOALS) {
                 map->goals_x[map->ngoals] = x;
                 map->goals_y[map->ngoals] = y;
                 map->ngoals++;
             }
+
+            // rover: if we see a (non-corrupted) rover cell in the map,
+            // prefer it over the 2-byte backup
+            if (is_rover_cell && !found_rover_cell) {
+                map->rover_x = x;
+                map->rover_y = y;
+                found_rover_cell = true;
+            }
         }
     }
-    
+
     fclose(file);
-    
-    // Apply 3x3 filter to corrupted cells
+
+    // now repair any map->is_corrupted cells
     apply_3x3_filter(map);
 }
 
@@ -116,26 +156,22 @@ void apply_3x3_filter(MapData* map) {
                     }
                 }
                 
-                // Find mode for height
+                // Find mode for height (smallest value wins ties)
                 int max_height_count = 0;
                 int mode_height = 0;
                 for (int i = 0; i < 8; i++) {
                     if (height_counts[i] > max_height_count) {
                         max_height_count = height_counts[i];
                         mode_height = i;
-                    } else if (height_counts[i] == max_height_count && i < mode_height) {
-                        mode_height = i;
                     }
                 }
                 
-                // Find mode for terrain
+                // Find mode for terrain (smallest value wins ties)
                 int max_terrain_count = 0;
                 int mode_terrain = 0;
                 for (int i = 0; i < 4; i++) {
                     if (terrain_counts[i] > max_terrain_count) {
                         max_terrain_count = terrain_counts[i];
-                        mode_terrain = i;
-                    } else if (terrain_counts[i] == max_terrain_count && i < mode_terrain) {
                         mode_terrain = i;
                     }
                 }
@@ -183,8 +219,8 @@ bool is_feasible_path(MapData* map, int start_x, int start_y, int end_x, int end
                 // Check if terrain is traversable
                 if (map->terrain_type[ny][nx] == 3) continue;
                 
-                // Check slope constraint
-                int slope = abs(map->topography[y][x] - map->topography[ny][nx]);
+                // Check slope constraint (> 1.5m means difference > 1 for integer heights)
+                int slope = abs((int)map->topography[y][x] - (int)map->topography[ny][nx]);
                 if (slope > 1) continue;
                 
                 visited[ny][nx] = true;
@@ -270,8 +306,8 @@ void simulate_path(MapData* map, int* final_x, int* final_y, int* energy, bool* 
                     return;
                 }
                 
-                // Check slope
-                int slope = abs(map->topography[y][x] - map->topography[new_y][new_x]);
+                // Check slope (> 1.5m means difference > 1 for integer heights)
+                int slope = abs((int)map->topography[y][x] - (int)map->topography[new_y][new_x]);
                 if (slope > 1) {
                     *feasible = false;
                     *final_x = x;
@@ -318,8 +354,8 @@ void simulate_path(MapData* map, int* final_x, int* final_y, int* energy, bool* 
                     return;
                 }
                 
-                // Check slope
-                int slope = abs(map->topography[y][x] - map->topography[new_y][new_x]);
+                // Check slope (> 1.5m means difference > 1 for integer heights)
+                int slope = abs((int)map->topography[y][x] - (int)map->topography[new_y][new_x]);
                 if (slope > 1) {
                     *feasible = false;
                     *final_x = x;
@@ -417,8 +453,23 @@ int main(int argc, char **argv) {
             return 1;
         }
         
+        // Validate rover starting position
+        if (map.rover_x >= MAP_SIZE || map.rover_y >= MAP_SIZE ||
+            map.terrain_type[map.rover_y][map.rover_x] == 3) {
+            printf("Input error: unable to process data/commands.\n");
+            return 1;
+        }
+        
         int goal_x = map.goals_x[goal_index];
         int goal_y = map.goals_y[goal_index];
+        
+        // Validate goal position
+        if (goal_x < 0 || goal_x >= MAP_SIZE || 
+            goal_y < 0 || goal_y >= MAP_SIZE ||
+            map.terrain_type[goal_y][goal_x] == 3) {
+            printf("Input error: unable to process data/commands.\n");
+            return 1;
+        }
         
         if (is_feasible_path(&map, map.rover_x, map.rover_y, goal_x, goal_y)) {
             printf("Feasible path exists.\n");
